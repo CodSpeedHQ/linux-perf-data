@@ -225,6 +225,7 @@ impl<R: Read> PerfFileReader<R> {
     /// Metadata (attributes and features) is embedded in the stream as
     /// synthesized records (PERF_RECORD_HEADER_ATTR, PERF_RECORD_HEADER_FEATURE).
     pub fn parse_pipe(mut reader: R) -> Result<Self, Error> {
+        eprintln!("HELLO WORLD");
         let pipe_header = PerfPipeHeader::parse(&mut reader)?;
         match &pipe_header.magic {
             b"PERFILE2" => Self::parse_pipe_impl::<LittleEndian>(reader, Endianness::LittleEndian),
@@ -472,12 +473,183 @@ impl<R: Read> PerfRecordIter<R> {
             };
 
             let size = header.size as usize;
+            let user_record_type = UserRecordType::try_from(RecordType(header.type_));
+
+            // Workaround for a kernel bug in PERF_RECORD_COMPRESSED2 (perf tools, not
+            // kernel proper). In builtin-record.c:record__pushfn(), the code does:
+            //   event->header.size = PERF_ALIGN(compressed, sizeof(u64));
+            // Since header.size is u16, any aligned value > 65535 silently truncates.
+            // This can produce size=0 (compressed ∈ [65529,65535]) or a small nonzero
+            // size (compressed > 65535, e.g. multi-record compression where the total
+            // wraps modulo 65536). The subsequent padding write fails silently.
+            //
+            // In the multi-record case, zstd_compress_stream_to_records() produces
+            // multiple concatenated COMPRESSED2 records in the output buffer. Only the
+            // first record's header/data_size are overwritten; subsequent sub-records
+            // have correct headers. The on-disk layout is:
+            //   [header1_corrupted(8)][data_size1_corrupted(8)][zstd1_data]
+            //   [header2_ok(8)][data_size2_unset(8)][zstd2_data]...
+            //
+            // Detection: data_size > body_len means overflow. Recovery: read remaining
+            // bytes, then split into sub-records using the intact headers of records 2+.
+            //
+            // See: tools/perf/builtin-record.c, record__pushfn()
+            if user_record_type == Some(UserRecordType::PERF_COMPRESSED2) {
+                // Read body bytes based on header.size (may be truncated or 0).
+                let body_already_read = if size >= PerfEventHeader::STRUCT_SIZE {
+                    let body_len = size - PerfEventHeader::STRUCT_SIZE;
+                    let mut body = vec![0u8; body_len];
+                    match self.reader.read_exact(&mut body) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            if self.record_data_len.is_none()
+                                && e.kind() == std::io::ErrorKind::UnexpectedEof
+                            {
+                                break;
+                            }
+                            return Err(ReadError::PerfEventData.into());
+                        }
+                    }
+                    body
+                } else {
+                    vec![]
+                };
+
+                // We need at least 8 bytes to read data_size.
+                // If body is too short (size was 0 or < 16), read more from stream.
+                let mut full_body;
+                if body_already_read.len() < 8 {
+                    let needed = 8 - body_already_read.len();
+                    let mut extra = vec![0u8; needed];
+                    self.reader
+                        .read_exact(&mut extra)
+                        .map_err(|_| ReadError::PerfEventData)?;
+                    full_body = body_already_read;
+                    full_body.extend_from_slice(&extra);
+                } else {
+                    full_body = body_already_read;
+                }
+
+                let data_size = T::read_u64(&full_body[0..8]) as usize;
+                let expected_aligned =
+                    (PerfEventHeader::STRUCT_SIZE + 8 + data_size + 7) & !7;
+
+                if expected_aligned <= size {
+                    // No overflow — normal COMPRESSED2 record.
+                    self.read_offset += size as u64;
+                    #[cfg(not(feature = "zstd"))]
+                    {
+                        return Err(Error::IoError(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "Compression support is not enabled.",
+                        )));
+                    }
+                    #[cfg(feature = "zstd")]
+                    {
+                        self.decompress_and_process_compressed2::<T>(
+                            &full_body,
+                        )?;
+                        continue;
+                    }
+                }
+
+                // Overflow detected. The true on-disk size is
+                // header(8) + data_size_field(8) + data_size bytes, no padding.
+                // Read any remaining bytes we haven't consumed yet.
+                let total_body = 8 + data_size; // data_size_field + compressed payload
+                if full_body.len() < total_body {
+                    let old_len = full_body.len();
+                    full_body.resize(total_body, 0);
+                    self.reader
+                        .read_exact(&mut full_body[old_len..])
+                        .map_err(|_| ReadError::PerfEventData)?;
+                }
+
+                self.read_offset +=
+                    (PerfEventHeader::STRUCT_SIZE + total_body) as u64;
+
+                // full_body now contains:
+                //   [data_size(8)][zstd1_data(?)][sub_record2_header(8)][sub2_data_size(8)][zstd2_data(?)]...
+                // For the single-record overflow case (compressed ∈ [65529,65535]),
+                // there are no sub-records — just decompress the payload directly.
+                // For multi-record, split at sub-record boundaries.
+                //
+                // Heuristic: if data_size <= 65519 (max single-record payload), it's
+                // a single record and the entire payload is one zstd stream.
+                // Otherwise, scan for sub-record headers to find boundaries.
+                #[cfg(not(feature = "zstd"))]
+                {
+                    return Err(Error::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "Compression support is not enabled.",
+                    )));
+                }
+                #[cfg(feature = "zstd")]
+                {
+                    // The max zstd output per sub-record is PERF_SAMPLE_MAX_SIZE -
+                    // sizeof(perf_record_compressed2) - 1 = 65519.
+                    const MAX_SINGLE_PAYLOAD: usize = 65519;
+
+                    if data_size <= MAX_SINGLE_PAYLOAD {
+                        // Single-record overflow: decompress directly.
+                        self.decompress_and_process_compressed2::<T>(
+                            &full_body[..8 + data_size],
+                        )?;
+                    } else {
+                        // Multi-record: the first sub-record's zstd payload runs
+                        // from byte 8 until the start of the second sub-record.
+                        // Find the second sub-record by scanning backward from
+                        // the end: chain sub-records from the tail using their
+                        // intact header.size values.
+                        let payload = &full_body[8..]; // everything after data_size field
+                        let tail_records = Self::find_tail_sub_records::<T>(payload);
+
+                        let first_zstd_end = if let Some(first_tail_offset) =
+                            tail_records.first().map(|&(off, _)| off)
+                        {
+                            first_tail_offset
+                        } else {
+                            payload.len()
+                        };
+
+                        // Decompress the first sub-record's zstd data.
+                        let first_zstd = &payload[..first_zstd_end];
+                        let mut fake_body = Vec::with_capacity(8 + first_zstd.len());
+                        let first_zstd_len = first_zstd.len() as u64;
+                        T::write_u64(&mut [0u8; 8], first_zstd_len);
+                        let mut ds_bytes = [0u8; 8];
+                        T::write_u64(&mut ds_bytes, first_zstd_len);
+                        fake_body.extend_from_slice(&ds_bytes);
+                        fake_body.extend_from_slice(first_zstd);
+                        self.decompress_and_process_compressed2::<T>(
+                            &fake_body,
+                        )?;
+
+                        // Process each tail sub-record. Their data_size field
+                        // is uninitialized (not set by process_comp_header), so
+                        // we compute the zstd payload size from header.size.
+                        for &(sub_off, sub_size) in &tail_records {
+                            let zstd_size = sub_size - PerfEventHeader::STRUCT_SIZE - 8;
+                            let zstd_data = &payload[sub_off + PerfEventHeader::STRUCT_SIZE + 8
+                                ..sub_off + sub_size];
+                            let mut sub_buf = Vec::with_capacity(8 + zstd_size);
+                            let mut ds = [0u8; 8];
+                            T::write_u64(&mut ds, zstd_size as u64);
+                            sub_buf.extend_from_slice(&ds);
+                            sub_buf.extend_from_slice(zstd_data);
+                            self.decompress_and_process_compressed2::<T>(
+                                &sub_buf,
+                            )?;
+                        }
+                    }
+                    continue;
+                }
+            }
+
             if size < PerfEventHeader::STRUCT_SIZE {
                 return Err(Error::InvalidPerfEventSize);
             }
             self.read_offset += u64::from(header.size);
-
-            let user_record_type = UserRecordType::try_from(RecordType(header.type_));
 
             if user_record_type == Some(UserRecordType::PERF_FINISHED_ROUND) {
                 self.sorter.finish_round();
@@ -516,20 +688,6 @@ impl<R: Read> PerfRecordIter<R> {
                 )));
             }
 
-            if user_record_type == Some(UserRecordType::PERF_COMPRESSED2) {
-                #[cfg(not(feature = "zstd"))]
-                {
-                    return Err(Error::IoError(std::io::Error::new(std::io::ErrorKind::Unsupported,
-                        "Compression support is not enabled. Please rebuild with the 'zstd' feature flag.",
-                    )));
-                }
-                #[cfg(feature = "zstd")]
-                {
-                    self.decompress_and_process_compressed2::<T>(&buffer)?;
-                    continue;
-                }
-            }
-
             self.process_record::<T>(header, buffer, offset)?;
         }
 
@@ -537,6 +695,54 @@ impl<R: Read> PerfRecordIter<R> {
         self.sorter.finish();
 
         Ok(())
+    }
+
+    /// Find sub-record boundaries in a multi-record COMPRESSED2 payload.
+    ///
+    /// In the multi-record case, the first sub-record's header is corrupted but
+    /// subsequent sub-records have intact headers set by `process_comp_header`.
+    /// We scan from the end of `payload` backward, chaining sub-records by their
+    /// `header.size` to find where the first sub-record's zstd data ends.
+    ///
+    /// Returns a list of (offset, size) pairs for sub-records 2+, sorted by offset.
+    fn find_tail_sub_records<T: ByteOrder>(payload: &[u8]) -> Vec<(usize, usize)> {
+        // Scan for COMPRESSED2 headers (type=83, misc=0) that chain to the end.
+        // Try every possible start position for the second sub-record.
+        let compressed2_type: u32 = 83;
+        for start in PerfEventHeader::STRUCT_SIZE..payload.len() {
+            if start + PerfEventHeader::STRUCT_SIZE > payload.len() {
+                break;
+            }
+            let type_ = T::read_u32(&payload[start..start + 4]);
+            let misc = T::read_u16(&payload[start + 4..start + 6]);
+            let size = T::read_u16(&payload[start + 6..start + 8]) as usize;
+            if type_ != compressed2_type || misc != 0 || size < 16 {
+                continue;
+            }
+            // Try to chain from here to the end of payload.
+            let mut records = vec![];
+            let mut pos = start;
+            let mut valid = true;
+            while pos < payload.len() {
+                if pos + PerfEventHeader::STRUCT_SIZE > payload.len() {
+                    valid = false;
+                    break;
+                }
+                let t = T::read_u32(&payload[pos..pos + 4]);
+                let m = T::read_u16(&payload[pos + 4..pos + 6]);
+                let s = T::read_u16(&payload[pos + 6..pos + 8]) as usize;
+                if t != compressed2_type || m != 0 || s < 16 {
+                    valid = false;
+                    break;
+                }
+                records.push((pos, s));
+                pos += s;
+            }
+            if valid && pos == payload.len() && !records.is_empty() {
+                return records;
+            }
+        }
+        vec![]
     }
 
     /// Process a single record and add it to the sorter
