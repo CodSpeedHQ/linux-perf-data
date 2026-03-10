@@ -66,4 +66,11 @@ impl ZstdDecompressor {
     pub fn save_partial_record(&mut self, data: &[u8]) {
         self.partial_record_buffer = data.to_vec();
     }
+
+    /// Discard any buffered partial record data. Call this when a corrupted
+    /// compressed record is skipped so stale partial data doesn't pollute
+    /// the next valid chunk.
+    pub fn discard_partial_record(&mut self) {
+        self.partial_record_buffer.clear();
+    }
 }
