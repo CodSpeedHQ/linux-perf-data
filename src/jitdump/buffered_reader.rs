@@ -44,6 +44,69 @@ impl<R: Read> BufferedReader<R> {
         }
     }
 
+    /// Try to make at least `len` bytes available without consuming them.
+    /// Returns the number of bytes currently available (which may be less than
+    /// `len` if we hit EOF). Used by recoverable parsers that need to scan
+    /// forward without committing to a read position.
+    pub fn ensure_available(&mut self, len: usize) -> Result<usize, std::io::Error> {
+        let available = self.available_data_len();
+        if available < len {
+            let extra_needed = len - available;
+            self.read_n_more_bytes(extra_needed)?;
+        }
+        Ok(self.available_data_len())
+    }
+
+    /// Peek at the next `len` bytes without advancing the read position.
+    /// Returns `None` if fewer than `len` bytes are currently available.
+    pub fn peek_data(&self, len: usize) -> Option<RawData<'_>> {
+        if self.available_data_len() < len {
+            return None;
+        }
+        Some(self.peek_slice(len))
+    }
+
+    /// Advance the read position by `len` bytes. Caller must have previously
+    /// confirmed availability via `ensure_available` / `peek_data`. Used by
+    /// the recoverable parser to skip past a resync gap once it has located
+    /// the next valid record.
+    pub fn advance(&mut self, len: usize) {
+        assert!(self.available_data_len() >= len);
+        match self.read_pos {
+            ReadPos::AtPosInFixedBuf(fixed_buf_read_pos) => {
+                self.read_pos = ReadPos::AtPosInFixedBuf(fixed_buf_read_pos + len);
+            }
+            ReadPos::AtPosInDynamicBuf(dynamic_buf_read_pos) => {
+                let remaining_dynamic_buf_len = self.dynamic_buf.len() - dynamic_buf_read_pos;
+                if len < remaining_dynamic_buf_len {
+                    self.read_pos = ReadPos::AtPosInDynamicBuf(dynamic_buf_read_pos + len);
+                } else {
+                    self.read_pos = ReadPos::AtPosInFixedBuf(len - remaining_dynamic_buf_len);
+                }
+            }
+        }
+    }
+
+    fn peek_slice(&self, len: usize) -> RawData<'_> {
+        match self.read_pos {
+            ReadPos::AtPosInFixedBuf(fixed_buf_read_pos) => {
+                RawData::Single(&self.fixed_buf[fixed_buf_read_pos..fixed_buf_read_pos + len])
+            }
+            ReadPos::AtPosInDynamicBuf(dynamic_buf_read_pos) => {
+                let remaining_dynamic_buf_len = self.dynamic_buf.len() - dynamic_buf_read_pos;
+                if len <= remaining_dynamic_buf_len {
+                    RawData::Single(
+                        &self.dynamic_buf[dynamic_buf_read_pos..dynamic_buf_read_pos + len],
+                    )
+                } else {
+                    let from_dynamic = &self.dynamic_buf[dynamic_buf_read_pos..];
+                    let from_fixed = &self.fixed_buf[..len - remaining_dynamic_buf_len];
+                    RawData::Split(from_dynamic, from_fixed)
+                }
+            }
+        }
+    }
+
     pub fn consume_data(&mut self, len: usize) -> Result<Option<RawData<'_>>, std::io::Error> {
         let available_data_len = self.available_data_len();
         if available_data_len < len {
