@@ -16,7 +16,8 @@ exclude = ["/.github", "/.vscode", "/tests"]
 byteorder = "1.4.3"
 memchr = "2.4.1"
 thiserror = "2"
-linux-perf-event-reader = "0.10.0"
+#TODO: Move this fork to CodSpeedHQ
+linux-perf-event-reader = { git = "https://github.com/AvalancheHQ/linux-perf-event-reader", rev = "136070d88667" }
 # linux-perf-event-reader = { path = "../linux-perf-event-reader" }
 linear-map = "1.2.0"
 prost = { version = "0.14", default-features = false, features = ["std"] }
@@ -24,5 +25,8 @@ prost-derive = "0.14"
 
 [dev-dependencies]
 yaxpeax-arch = { version = "0.3", default-features = false }
-yaxpeax-x86 = { version = "2", default-features = false, features = ["std", "fmt"] }
+yaxpeax-x86 = { version = "2", default-features = false, features = [
+    "std",
+    "fmt",
+] }
 yaxpeax-arm = { version = "0.3", default-features = false, features = ["std"] }
